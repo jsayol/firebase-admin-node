@@ -79,6 +79,13 @@ interface LowLevelError extends Error {
   response?: LowLevelResponse;
 }
 
+interface RetryConfig {
+  maxRetries: number;
+  statusCodes: number[];
+  backOffFactor: number;
+  maxDelayInMillis: number;
+}
+
 class DefaultHttpResponse implements HttpResponse {
 
   public readonly status: number;
@@ -168,6 +175,17 @@ export class HttpError extends Error {
 
 export class HttpClient {
 
+  constructor(private readonly retry?: RetryConfig) {
+    if (typeof retry === 'undefined') {
+      this.retry = {
+        maxRetries: 1,
+        statusCodes: [],
+        backOffFactor: 0,
+        maxDelayInMillis: 10000,
+      };
+    }
+  }
+
   /**
    * Sends an HTTP request to a remote server. If the server responds with a successful response (2xx), the returned
    * promise resolves with an HttpResponse. If the server responds with an error (3xx, 4xx, 5xx), the promise rejects
@@ -194,9 +212,20 @@ export class HttpClient {
       .then((resp) => {
         return this.createHttpResponse(resp);
       }).catch((err: LowLevelError) => {
-        const retryCodes = ['ECONNRESET', 'ETIMEDOUT'];
-        if (retryCodes.indexOf(err.code) !== -1 && attempts === 0) {
-          return this.sendWithRetry(config, attempts + 1);
+        if (this.isRetryEligible(attempts, err)) {
+          try {
+            const delayMillis = this.getRetryDelay(attempts, err);
+            if (delayMillis <= 0) {
+              return this.sendWithRetry(config, attempts + 1);
+            }
+            return new Promise((resolve) => {
+              setTimeout(resolve, delayMillis);
+            }).then(() => {
+              return this.sendWithRetry(config, attempts + 1);
+            });
+          } catch (err) {
+            // ignore err
+          }
         }
         if (err.response) {
           throw new HttpError(this.createHttpResponse(err.response));
@@ -210,6 +239,65 @@ export class HttpClient {
           AppErrorCodes.NETWORK_ERROR,
           `Error while making request: ${err.message}. Error code: ${err.code}`);
       });
+  }
+
+  private isRetryEligible(retries: number, err: LowLevelError): boolean {
+    if (!this.retry) {
+      return false;
+    }
+    if (retries >= this.retry.maxRetries) {
+      return false;
+    }
+    if (err.response && this.retry.statusCodes.indexOf(err.response.status) === 0) {
+      return false;
+    }
+    const retryCodes = ['ECONNRESET', 'ETIMEDOUT'];
+    if (retryCodes.indexOf(err.code) === -1) {
+      return false;
+    }
+    return true;
+  }
+
+  private getRetryDelay(retries: number, err: LowLevelError): number {
+    let estimatedDelay = this.getClientEstimatedDelay(retries);
+    const serverRecommendedDelay = this.getServerRecommendedDelayMillis(err);
+    if (serverRecommendedDelay > estimatedDelay) {
+      estimatedDelay = serverRecommendedDelay;
+    }
+    if (estimatedDelay > this.retry.maxDelayInMillis) {
+      throw new Error('retry delay too long');
+    }
+    return estimatedDelay;
+  }
+
+  private getServerRecommendedDelayMillis(err: LowLevelError): number {
+    if (!err.response) {
+      return -1;
+    }
+
+    const retryAfter = err.response.headers['retry-after'];
+    if (!retryAfter) {
+      return -1;
+    }
+
+    const delaySeconds: number = parseInt(retryAfter, 10);
+    if (!isNaN(delaySeconds)) {
+      return delaySeconds * 1000;
+    }
+
+    const date = new Date(retryAfter);
+    if (isNaN(date.getTime())) {
+      return -1;
+    }
+    return date.getTime() - Date.now();
+  }
+
+  private getClientEstimatedDelay(retries: number): number {
+    if (retries === 0) {
+      return 0;
+    }
+    const delayInSeconds = (2 ** retries) * this.retry.backOffFactor;
+    return Math.min(delayInSeconds * 1000, this.retry.maxDelayInMillis);
   }
 
   private createHttpResponse(resp: LowLevelResponse): HttpResponse {
