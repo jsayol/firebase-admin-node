@@ -324,6 +324,7 @@ export class AppErrorCodes {
   public static INTERNAL_ERROR = 'internal-error';
   public static INVALID_APP_NAME = 'invalid-app-name';
   public static INVALID_APP_OPTIONS = 'invalid-app-options';
+  public static INVALID_ARGUMENT = 'invalid-argument';
   public static INVALID_CREDENTIAL = 'invalid-credential';
   public static NETWORK_ERROR = 'network-error';
   public static NETWORK_TIMEOUT = 'network-timeout';

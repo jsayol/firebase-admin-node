@@ -15,7 +15,7 @@
  */
 
 import {FirebaseApp} from '../firebase-app';
-import {AppErrorCodes, FirebaseAppError} from './error';
+import {AppErrorCodes, FirebaseAppError, FirebaseError} from './error';
 import * as validator from './validator';
 
 import http = require('http');
@@ -81,7 +81,7 @@ interface LowLevelError extends Error {
 
 interface RetryConfig {
   maxRetries: number;
-  statusCodes: number[];
+  statusCodes?: number[];
   backOffFactor: number;
   maxDelayInMillis: number;
 }
@@ -173,16 +173,40 @@ export class HttpError extends Error {
   }
 }
 
+const DEFAULT_RETRY_CONFIG: RetryConfig = {
+  maxRetries: 1,
+  backOffFactor: 0,
+  maxDelayInMillis: 60 * 1000,
+};
+
+function validateRetryConfig(retry: RetryConfig) {
+  if (!validator.isNumber(retry.maxRetries) || retry.maxRetries < 0) {
+    throw new FirebaseAppError(
+      AppErrorCodes.INVALID_ARGUMENT,
+      'maxRetries must be a non-negative integer');
+  }
+  if (!validator.isNumber(retry.backOffFactor) || retry.backOffFactor < 0) {
+    throw new FirebaseAppError(
+      AppErrorCodes.INVALID_ARGUMENT,
+      'backOffFactor must be a non-negative number');
+  }
+  if (!validator.isNumber(retry.maxDelayInMillis) || retry.maxDelayInMillis < 0) {
+    throw new FirebaseAppError(
+      AppErrorCodes.INVALID_ARGUMENT,
+      'maxDelayInMillis must be a non-negative number');
+  }
+  if (typeof retry.statusCodes !== 'undefined' && !validator.isArray(retry.statusCodes)) {
+    throw new FirebaseAppError(
+      AppErrorCodes.INVALID_ARGUMENT,
+      'statusCodes must be an array');
+  }
+}
+
 export class HttpClient {
 
-  constructor(private readonly retry?: RetryConfig) {
-    if (typeof retry === 'undefined') {
-      this.retry = {
-        maxRetries: 1,
-        statusCodes: [],
-        backOffFactor: 0,
-        maxDelayInMillis: 10000,
-      };
+  constructor(private readonly retry: RetryConfig = DEFAULT_RETRY_CONFIG) {
+    if (this.retry) {
+      validateRetryConfig(this.retry);
     }
   }
 
@@ -213,18 +237,9 @@ export class HttpClient {
         return this.createHttpResponse(resp);
       }).catch((err: LowLevelError) => {
         if (this.isRetryEligible(attempts, err)) {
-          try {
-            const delayMillis = this.getRetryDelay(attempts, err);
-            if (delayMillis <= 0) {
-              return this.sendWithRetry(config, attempts + 1);
-            }
-            return new Promise((resolve) => {
-              setTimeout(resolve, delayMillis);
-            }).then(() => {
-              return this.sendWithRetry(config, attempts + 1);
-            });
-          } catch (err) {
-            // ignore err
+          const delayMillis = this.getRetryDelayMillis(attempts, err.response);
+          if (delayMillis <= this.retry.maxDelayInMillis) {
+            return this.retryRequest(config, attempts + 1, delayMillis);
           }
         }
         if (err.response) {
@@ -241,61 +256,70 @@ export class HttpClient {
       });
   }
 
+  private retryRequest(config: HttpRequestConfig, attempts: number, delayMillis: number): Promise<HttpResponse> {
+    if (delayMillis > 0) {
+      return new Promise((resolve) => {
+        setTimeout(resolve, delayMillis);
+      }).then(() => {
+        return this.sendWithRetry(config, attempts);
+      });
+    }
+    return this.sendWithRetry(config, attempts);
+  }
+
   private isRetryEligible(retries: number, err: LowLevelError): boolean {
     if (!this.retry) {
       return false;
     }
+
     if (retries >= this.retry.maxRetries) {
       return false;
     }
-    if (err.response && this.retry.statusCodes.indexOf(err.response.status) === 0) {
-      return false;
+
+    if (err.response) {
+      const statusCodes = this.retry.statusCodes || [];
+      if (statusCodes.indexOf(err.response.status) === -1) {
+        return false;
+      }
     }
+
     const retryCodes = ['ECONNRESET', 'ETIMEDOUT'];
-    if (retryCodes.indexOf(err.code) === -1) {
-      return false;
-    }
-    return true;
+    return retryCodes.indexOf(err.code) !== -1;
   }
 
-  private getRetryDelay(retries: number, err: LowLevelError): number {
-    let estimatedDelay = this.getClientEstimatedDelay(retries);
-    const serverRecommendedDelay = this.getServerRecommendedDelayMillis(err);
-    if (serverRecommendedDelay > estimatedDelay) {
-      estimatedDelay = serverRecommendedDelay;
+  private getRetryDelayMillis(retries: number, response: LowLevelResponse): number {
+    if (response && response.headers['retry-after']) {
+      const delayMillis = this.parseRetryAfterIntoMillis(response.headers['retry-after']);
+      if (delayMillis > 0) {
+        return delayMillis;
+      }
     }
-    if (estimatedDelay > this.retry.maxDelayInMillis) {
-      throw new Error('retry delay too long');
-    }
-    return estimatedDelay;
+
+    return this.backOffDelayMillis(retries);
   }
 
-  private getServerRecommendedDelayMillis(err: LowLevelError): number {
-    if (!err.response) {
-      return -1;
-    }
-
-    const retryAfter = err.response.headers['retry-after'];
-    if (!retryAfter) {
-      return -1;
-    }
-
+  /**
+   * Parses the Retry-After HTTP header as a milliseconds value. Return value is negative if the Retry-After header
+   * contains an expired timestamp or otherwise malformed.
+   */
+  private parseRetryAfterIntoMillis(retryAfter: string): number {
     const delaySeconds: number = parseInt(retryAfter, 10);
     if (!isNaN(delaySeconds)) {
       return delaySeconds * 1000;
     }
 
     const date = new Date(retryAfter);
-    if (isNaN(date.getTime())) {
-      return -1;
+    if (!isNaN(date.getTime())) {
+      return date.getTime() - Date.now();
     }
-    return date.getTime() - Date.now();
+    return -1;
   }
 
-  private getClientEstimatedDelay(retries: number): number {
+  private backOffDelayMillis(retries: number): number {
     if (retries === 0) {
       return 0;
     }
+
     const delayInSeconds = (2 ** retries) * this.retry.backOffFactor;
     return Math.min(delayInSeconds * 1000, this.retry.maxDelayInMillis);
   }

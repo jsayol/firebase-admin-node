@@ -22,7 +22,7 @@ import url = require('url');
  * @param {any} value The value to validate.
  * @return {boolean} Whether the value is byte buffer or not.
  */
-export function isBuffer(value: any): boolean {
+export function isBuffer(value: any): value is Buffer {
   return value instanceof Buffer;
 }
 
