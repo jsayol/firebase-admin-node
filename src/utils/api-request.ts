@@ -79,10 +79,10 @@ interface LowLevelError extends Error {
   response?: LowLevelResponse;
 }
 
-interface RetryConfig {
+export interface RetryConfig {
   maxRetries: number;
   statusCodes?: number[];
-  backOffFactor: number;
+  backOffFactor?: number;
   maxDelayInMillis: number;
 }
 
@@ -175,7 +175,6 @@ export class HttpError extends Error {
 
 const DEFAULT_RETRY_CONFIG: RetryConfig = {
   maxRetries: 1,
-  backOffFactor: 0,
   maxDelayInMillis: 60 * 1000,
 };
 
@@ -185,10 +184,12 @@ function validateRetryConfig(retry: RetryConfig) {
       AppErrorCodes.INVALID_ARGUMENT,
       'maxRetries must be a non-negative integer');
   }
-  if (!validator.isNumber(retry.backOffFactor) || retry.backOffFactor < 0) {
-    throw new FirebaseAppError(
-      AppErrorCodes.INVALID_ARGUMENT,
-      'backOffFactor must be a non-negative number');
+  if (typeof retry.backOffFactor !== 'undefined') {
+    if (!validator.isNumber(retry.backOffFactor) || retry.backOffFactor < 0) {
+      throw new FirebaseAppError(
+        AppErrorCodes.INVALID_ARGUMENT,
+        'backOffFactor must be a non-negative number');
+    }
   }
   if (!validator.isNumber(retry.maxDelayInMillis) || retry.maxDelayInMillis < 0) {
     throw new FirebaseAppError(
@@ -229,31 +230,48 @@ export class HttpClient {
   }
 
   /**
-   * Sends an HTTP request, and retries it once in case of low-level network errors.
+   * Sends an HTTP request. In the event of an errors, retries the request according to the RetryConfig set on ths
+   * client.
    */
   private sendWithRetry(config: HttpRequestConfig, attempts: number = 0): Promise<HttpResponse> {
     return AsyncHttpCall.invoke(config)
       .then((resp) => {
         return this.createHttpResponse(resp);
       }).catch((err: LowLevelError) => {
-        if (this.isRetryEligible(attempts, err)) {
-          const delayMillis = this.getRetryDelayMillis(attempts, err.response);
-          if (delayMillis <= this.retry.maxDelayInMillis) {
-            return this.retryRequest(config, attempts + 1, delayMillis);
-          }
+        const [delayMillis, canRetry] = this.getRetryDelayMillis(attempts, err);
+        if (canRetry && delayMillis <= this.retry.maxDelayInMillis) {
+          return this.retryRequest(config, attempts + 1, delayMillis);
         }
+
         if (err.response) {
           throw new HttpError(this.createHttpResponse(err.response));
         }
+
         if (err.code === 'ETIMEDOUT') {
           throw new FirebaseAppError(
             AppErrorCodes.NETWORK_TIMEOUT,
             `Error while making request: ${err.message}.`);
         }
+
         throw new FirebaseAppError(
           AppErrorCodes.NETWORK_ERROR,
           `Error while making request: ${err.message}. Error code: ${err.code}`);
       });
+  }
+
+  private getRetryDelayMillis(retries: number, err: LowLevelError): [number, boolean] {
+    if (!this.isRetryEligible(retries, err)) {
+      return [0, false];
+    }
+    const response = err.response;
+    if (response && response.headers['retry-after']) {
+      const delayMillis = this.parseRetryAfterIntoMillis(response.headers['retry-after']);
+      if (delayMillis > 0) {
+        return [delayMillis, true];
+      }
+    }
+
+    return [this.backOffDelayMillis(retries), true];
   }
 
   private retryRequest(config: HttpRequestConfig, attempts: number, delayMillis: number): Promise<HttpResponse> {
@@ -278,24 +296,11 @@ export class HttpClient {
 
     if (err.response) {
       const statusCodes = this.retry.statusCodes || [];
-      if (statusCodes.indexOf(err.response.status) === -1) {
-        return false;
-      }
+      return statusCodes.indexOf(err.response.status) !== -1;
     }
 
     const retryCodes = ['ECONNRESET', 'ETIMEDOUT'];
     return retryCodes.indexOf(err.code) !== -1;
-  }
-
-  private getRetryDelayMillis(retries: number, response: LowLevelResponse): number {
-    if (response && response.headers['retry-after']) {
-      const delayMillis = this.parseRetryAfterIntoMillis(response.headers['retry-after']);
-      if (delayMillis > 0) {
-        return delayMillis;
-      }
-    }
-
-    return this.backOffDelayMillis(retries);
   }
 
   /**
@@ -320,7 +325,8 @@ export class HttpClient {
       return 0;
     }
 
-    const delayInSeconds = (2 ** retries) * this.retry.backOffFactor;
+    const backOffFactor = this.retry.backOffFactor || 0;
+    const delayInSeconds = (2 ** retries) * backOffFactor;
     return Math.min(delayInSeconds * 1000, this.retry.maxDelayInMillis);
   }
 

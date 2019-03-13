@@ -27,7 +27,8 @@ import * as mocks from '../../resources/mocks';
 
 import {FirebaseApp} from '../../../src/firebase-app';
 import {
-  ApiSettings, HttpClient, HttpError, AuthorizedHttpClient, ApiCallbackFunction, HttpRequestConfig, parseHttpResponse,
+  ApiSettings, HttpClient, HttpError, AuthorizedHttpClient, ApiCallbackFunction,
+  HttpRequestConfig, parseHttpResponse, RetryConfig,
 } from '../../../src/utils/api-request';
 import { deepCopy } from '../../../src/utils/deep-copy';
 import {Agent} from 'http';
@@ -110,6 +111,43 @@ describe('HttpClient', () => {
       transportSpy.restore();
       transportSpy = null;
     }
+  });
+
+  it('should be initialized with a default retry config', () => {
+    const client = new HttpClient();
+    const retry: RetryConfig = (client as any).retry;
+    expect(retry.maxRetries).to.equal(1);
+    expect(retry.maxDelayInMillis).to.equal(60 * 1000);
+    expect(retry.backOffFactor).to.be.undefined;
+    expect(retry.statusCodes).to.be.undefined;
+  });
+
+  ['string', null, undefined, true, -1].forEach((maxRetries) => {
+    it(`should throw when maxRetries is ${maxRetries}`, () => {
+      const retry: any = {maxRetries};
+      expect(() => new HttpClient(retry)).to.throw('maxRetries must be a non-negative integer');
+    });
+  });
+
+  ['string', null, true, -1].forEach((backOffFactor) => {
+    it(`should throw when backOffFactor is ${backOffFactor}`, () => {
+      const retry: any = {maxRetries: 1, backOffFactor};
+      expect(() => new HttpClient(retry)).to.throw('backOffFactor must be a non-negative number');
+    });
+  });
+
+  ['string', null, undefined, true, -1].forEach((maxDelayInMillis) => {
+    it(`should throw when maxDelayMillis is ${maxDelayInMillis}`, () => {
+      const retry: any = {maxRetries: 1, maxDelayInMillis};
+      expect(() => new HttpClient(retry)).to.throw('maxDelayInMillis must be a non-negative number');
+    });
+  });
+
+  ['string', null, true, 0, 1, {}].forEach((statusCodes) => {
+    it(`should throw when statusCodes is ${statusCodes}`, () => {
+      const retry: any = {maxRetries: 1, maxDelayInMillis: 100, statusCodes};
+      expect(() => new HttpClient(retry)).to.throw('statusCodes must be an array');
+    });
   });
 
   it('should be fulfilled for a 2xx response with a json payload', () => {
@@ -633,6 +671,73 @@ describe('HttpClient', () => {
     }).then((resp) => {
       expect(resp.status).to.equal(200);
       expect(resp.data).to.deep.equal(respData);
+    });
+  });
+
+  it('should not retry when maxRetries is set to 0', () => {
+    mockedRequests.push(mockRequestWithError({message: 'connection reset 1', code: 'ECONNRESET'}));
+    const client = new HttpClient({
+      maxRetries: 0,
+      maxDelayInMillis: 10000,
+    });
+    const err = 'Error while making request: connection reset 1';
+    return client.send({
+      method: 'GET',
+      url: mockUrl,
+    }).should.eventually.be.rejectedWith(err).and.have.property('code', 'app/network-error');
+  });
+
+  it('should succeed after a retry on a configured HTTP error', () => {
+    const scope1 = nock('https://' + mockHost)
+      .get(mockPath)
+      .reply(503, {}, {
+        'content-type': 'application/json',
+      });
+    mockedRequests.push(scope1);
+    const respData = {foo: 'bar'};
+    const scope2 = nock('https://' + mockHost)
+      .get(mockPath)
+      .reply(200, respData, {
+        'content-type': 'application/json',
+      });
+    mockedRequests.push(scope2);
+    const client = new HttpClient({
+      maxRetries: 1,
+      maxDelayInMillis: 1000,
+      statusCodes: [503],
+    });
+    return client.send({
+      method: 'GET',
+      url: mockUrl,
+    }).then((resp) => {
+      expect(resp.status).to.equal(200);
+      expect(resp.data).to.deep.equal(respData);
+    });
+  });
+
+  it('should not retry when retry-after exceeds maxDelayInMillis', () => {
+    const scope1 = nock('https://' + mockHost)
+      .get(mockPath)
+      .reply(503, {}, {
+        'content-type': 'application/json',
+        'retry-after': '61',
+      });
+    mockedRequests.push(scope1);
+    const client = new HttpClient({
+      maxRetries: 1,
+      maxDelayInMillis: 60 * 1000,
+      statusCodes: [503],
+    });
+    return client.send({
+      method: 'GET',
+      url: mockUrl,
+    }).catch((err: HttpError) => {
+      expect(err.message).to.equal('Server responded with status 503.');
+      const resp = err.response;
+      expect(resp.status).to.equal(503);
+      expect(resp.headers['content-type']).to.equal('application/json');
+      expect(resp.data).to.deep.equal({});
+      expect(resp.isJson()).to.be.true;
     });
   });
 
