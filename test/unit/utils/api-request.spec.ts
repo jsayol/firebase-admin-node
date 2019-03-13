@@ -28,7 +28,7 @@ import * as mocks from '../../resources/mocks';
 import {FirebaseApp} from '../../../src/firebase-app';
 import {
   ApiSettings, HttpClient, HttpError, AuthorizedHttpClient, ApiCallbackFunction,
-  HttpRequestConfig, parseHttpResponse, RetryConfig,
+  HttpRequestConfig, parseHttpResponse, RetryConfig, HttpResponse,
 } from '../../../src/utils/api-request';
 import { deepCopy } from '../../../src/utils/deep-copy';
 import {Agent} from 'http';
@@ -95,6 +95,7 @@ function mockRequestWithError(err: any) {
 describe('HttpClient', () => {
   let mockedRequests: nock.Scope[] = [];
   let transportSpy: sinon.SinonSpy = null;
+  let delayStub: sinon.SinonStub = null;
 
   const sampleMultipartData = '--boundary\r\n'
       + 'Content-type: application/json\r\n\r\n'
@@ -110,6 +111,10 @@ describe('HttpClient', () => {
     if (transportSpy) {
       transportSpy.restore();
       transportSpy = null;
+    }
+    if (delayStub) {
+      delayStub.restore();
+      delayStub = null;
     }
   });
 
@@ -674,6 +679,16 @@ describe('HttpClient', () => {
     });
   });
 
+  it('should not retry when RetryConfig is not set', () => {
+    mockedRequests.push(mockRequestWithError({message: 'connection reset 1', code: 'ECONNRESET'}));
+    const client = new HttpClient(null);
+    const err = 'Error while making request: connection reset 1';
+    return client.send({
+      method: 'GET',
+      url: mockUrl,
+    }).should.eventually.be.rejectedWith(err).and.have.property('code', 'app/network-error');
+  });
+
   it('should not retry when maxRetries is set to 0', () => {
     mockedRequests.push(mockRequestWithError({message: 'connection reset 1', code: 'ECONNRESET'}));
     const client = new HttpClient({
@@ -715,14 +730,46 @@ describe('HttpClient', () => {
     });
   });
 
+  it('should not retry more than maxRetries', () => {
+    // simulate 2 low-level errors
+    mockedRequests.push(mockRequestWithError({message: 'connection reset 1', code: 'ECONNRESET'}));
+    mockedRequests.push(mockRequestWithError({message: 'connection reset 2', code: 'ECONNRESET'}));
+
+    // followed by 3 HTTP errors
+    const scope = nock('https://' + mockHost)
+      .get(mockPath)
+      .times(3)
+      .reply(503, {}, {
+        'content-type': 'application/json',
+      });
+    mockedRequests.push(scope);
+
+    const client = new HttpClient({
+      maxRetries: 4,
+      maxDelayInMillis: 10 * 1000,
+      statusCodes: [503],
+    });
+    return client.send({
+      method: 'GET',
+      url: mockUrl,
+    }).catch((err: HttpError) => {
+      expect(err.message).to.equal('Server responded with status 503.');
+      const resp = err.response;
+      expect(resp.status).to.equal(503);
+      expect(resp.headers['content-type']).to.equal('application/json');
+      expect(resp.data).to.deep.equal({});
+      expect(resp.isJson()).to.be.true;
+    });
+  });
+
   it('should not retry when retry-after exceeds maxDelayInMillis', () => {
-    const scope1 = nock('https://' + mockHost)
+    const scope = nock('https://' + mockHost)
       .get(mockPath)
       .reply(503, {}, {
         'content-type': 'application/json',
         'retry-after': '61',
       });
-    mockedRequests.push(scope1);
+    mockedRequests.push(scope);
     const client = new HttpClient({
       maxRetries: 1,
       maxDelayInMillis: 60 * 1000,
@@ -738,6 +785,246 @@ describe('HttpClient', () => {
       expect(resp.headers['content-type']).to.equal('application/json');
       expect(resp.data).to.deep.equal({});
       expect(resp.isJson()).to.be.true;
+    });
+  });
+
+  it('should retry with exponential back off', () => {
+    const scope = nock('https://' + mockHost)
+      .get(mockPath)
+      .times(5)
+      .reply(503, {}, {
+        'content-type': 'application/json',
+      });
+    mockedRequests.push(scope);
+    const client = new HttpClient({
+      maxRetries: 4,
+      backOffFactor: 0.5,
+      maxDelayInMillis: 60 * 1000,
+      statusCodes: [503],
+    });
+    delayStub = sinon.stub(client as any, 'waitForRetry').resolves();
+    return client.send({
+      method: 'GET',
+      url: mockUrl,
+    }).catch((err: HttpError) => {
+      expect(err.message).to.equal('Server responded with status 503.');
+      const resp = err.response;
+      expect(resp.status).to.equal(503);
+      expect(resp.headers['content-type']).to.equal('application/json');
+      expect(resp.data).to.deep.equal({});
+      expect(resp.isJson()).to.be.true;
+      expect(delayStub.callCount).to.equal(4);
+      const delays = delayStub.args.map((args) => args[0]);
+      expect(delays).to.deep.equal([0, 1000, 2000, 4000]);
+    });
+  });
+
+  it('delay should not exceed maxDelayInMillis', () => {
+    const scope = nock('https://' + mockHost)
+      .get(mockPath)
+      .times(5)
+      .reply(503, {}, {
+        'content-type': 'application/json',
+      });
+    mockedRequests.push(scope);
+    const client = new HttpClient({
+      maxRetries: 4,
+      backOffFactor: 1,
+      maxDelayInMillis: 4 * 1000,
+      statusCodes: [503],
+    });
+    delayStub = sinon.stub(client as any, 'waitForRetry').resolves();
+    return client.send({
+      method: 'GET',
+      url: mockUrl,
+    }).catch((err: HttpError) => {
+      expect(err.message).to.equal('Server responded with status 503.');
+      const resp = err.response;
+      expect(resp.status).to.equal(503);
+      expect(resp.headers['content-type']).to.equal('application/json');
+      expect(resp.data).to.deep.equal({});
+      expect(resp.isJson()).to.be.true;
+      expect(delayStub.callCount).to.equal(4);
+      const delays = delayStub.args.map((args) => args[0]);
+      expect(delays).to.deep.equal([0, 2000, 4000, 4000]);
+    });
+  });
+
+  it('should retry without delays when backOffFactor is not set', () => {
+    const scope = nock('https://' + mockHost)
+      .get(mockPath)
+      .times(5)
+      .reply(503, {}, {
+        'content-type': 'application/json',
+      });
+    mockedRequests.push(scope);
+    const client = new HttpClient({
+      maxRetries: 4,
+      maxDelayInMillis: 60 * 1000,
+      statusCodes: [503],
+    });
+    delayStub = sinon.stub(client as any, 'waitForRetry').resolves();
+    return client.send({
+      method: 'GET',
+      url: mockUrl,
+    }).catch((err: HttpError) => {
+      expect(err.message).to.equal('Server responded with status 503.');
+      const resp = err.response;
+      expect(resp.status).to.equal(503);
+      expect(resp.headers['content-type']).to.equal('application/json');
+      expect(resp.data).to.deep.equal({});
+      expect(resp.isJson()).to.be.true;
+      expect(delayStub.callCount).to.equal(4);
+      const delays = delayStub.args.map((args) => args[0]);
+      expect(delays).to.deep.equal([0, 0, 0, 0]);
+    });
+  });
+
+  it('should wait when retry-after expressed as seconds', () => {
+    const scope1 = nock('https://' + mockHost)
+      .get(mockPath)
+      .reply(503, {}, {
+        'content-type': 'application/json',
+        'retry-after': '30',
+      });
+    mockedRequests.push(scope1);
+    const respData = {foo: 'bar'};
+    const scope2 = nock('https://' + mockHost)
+      .get(mockPath)
+      .reply(200, respData, {
+        'content-type': 'application/json',
+      });
+    mockedRequests.push(scope2);
+
+    const client = new HttpClient({
+      maxRetries: 4,
+      backOffFactor: 0.5,
+      maxDelayInMillis: 60 * 1000,
+      statusCodes: [503],
+    });
+    delayStub = sinon.stub(client as any, 'waitForRetry').resolves();
+    return client.send({
+      method: 'GET',
+      url: mockUrl,
+    }).then((resp: HttpResponse) => {
+      expect(resp.status).to.equal(200);
+      expect(resp.headers['content-type']).to.equal('application/json');
+      expect(resp.data).to.deep.equal(respData);
+      expect(resp.isJson()).to.be.true;
+      expect(delayStub.callCount).to.equal(1);
+      expect(delayStub.args[0][0]).to.equal(30 * 1000);
+    });
+  });
+
+  it('should wait when retry-after expressed as a timestamp', () => {
+    const timestamp = new Date(Date.now() + 30 * 1000);
+
+    const scope1 = nock('https://' + mockHost)
+      .get(mockPath)
+      .reply(503, {}, {
+        'content-type': 'application/json',
+        'retry-after': timestamp.toUTCString(),
+      });
+    mockedRequests.push(scope1);
+    const respData = {foo: 'bar'};
+    const scope2 = nock('https://' + mockHost)
+      .get(mockPath)
+      .reply(200, respData, {
+        'content-type': 'application/json',
+      });
+    mockedRequests.push(scope2);
+
+    const client = new HttpClient({
+      maxRetries: 4,
+      backOffFactor: 0.5,
+      maxDelayInMillis: 60 * 1000,
+      statusCodes: [503],
+    });
+    delayStub = sinon.stub(client as any, 'waitForRetry').resolves();
+    return client.send({
+      method: 'GET',
+      url: mockUrl,
+    }).then((resp: HttpResponse) => {
+      expect(resp.status).to.equal(200);
+      expect(resp.headers['content-type']).to.equal('application/json');
+      expect(resp.data).to.deep.equal(respData);
+      expect(resp.isJson()).to.be.true;
+      expect(delayStub.callCount).to.equal(1);
+      expect(delayStub.args[0][0]).to.be.gt(27 * 1000).and.to.be.lte(30 * 1000);
+    });
+  });
+
+  it('should not wait when retry-after timestamp is expired', () => {
+    const timestamp = new Date(Date.now() - 30 * 1000);
+
+    const scope1 = nock('https://' + mockHost)
+      .get(mockPath)
+      .reply(503, {}, {
+        'content-type': 'application/json',
+        'retry-after': timestamp.toUTCString(),
+      });
+    mockedRequests.push(scope1);
+    const respData = {foo: 'bar'};
+    const scope2 = nock('https://' + mockHost)
+      .get(mockPath)
+      .reply(200, respData, {
+        'content-type': 'application/json',
+      });
+    mockedRequests.push(scope2);
+
+    const client = new HttpClient({
+      maxRetries: 4,
+      backOffFactor: 0.5,
+      maxDelayInMillis: 60 * 1000,
+      statusCodes: [503],
+    });
+    delayStub = sinon.stub(client as any, 'waitForRetry').resolves();
+    return client.send({
+      method: 'GET',
+      url: mockUrl,
+    }).then((resp: HttpResponse) => {
+      expect(resp.status).to.equal(200);
+      expect(resp.headers['content-type']).to.equal('application/json');
+      expect(resp.data).to.deep.equal(respData);
+      expect(resp.isJson()).to.be.true;
+      expect(delayStub.callCount).to.equal(1);
+      expect(delayStub.args[0][0]).to.equal(0);
+    });
+  });
+
+  it('should not wait when retry-after is malformed', () => {
+    const scope1 = nock('https://' + mockHost)
+      .get(mockPath)
+      .reply(503, {}, {
+        'content-type': 'application/json',
+        'retry-after': 'invalid',
+      });
+    mockedRequests.push(scope1);
+    const respData = {foo: 'bar'};
+    const scope2 = nock('https://' + mockHost)
+      .get(mockPath)
+      .reply(200, respData, {
+        'content-type': 'application/json',
+      });
+    mockedRequests.push(scope2);
+
+    const client = new HttpClient({
+      maxRetries: 4,
+      backOffFactor: 0.5,
+      maxDelayInMillis: 60 * 1000,
+      statusCodes: [503],
+    });
+    delayStub = sinon.stub(client as any, 'waitForRetry').resolves();
+    return client.send({
+      method: 'GET',
+      url: mockUrl,
+    }).then((resp: HttpResponse) => {
+      expect(resp.status).to.equal(200);
+      expect(resp.headers['content-type']).to.equal('application/json');
+      expect(resp.data).to.deep.equal(respData);
+      expect(resp.isJson()).to.be.true;
+      expect(delayStub.callCount).to.equal(1);
+      expect(delayStub.args[0][0]).to.equal(0);
     });
   });
 

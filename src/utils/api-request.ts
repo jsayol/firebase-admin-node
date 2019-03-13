@@ -240,7 +240,9 @@ export class HttpClient {
       }).catch((err: LowLevelError) => {
         const [delayMillis, canRetry] = this.getRetryDelayMillis(attempts, err);
         if (canRetry && delayMillis <= this.retry.maxDelayInMillis) {
-          return this.retryRequest(config, attempts + 1, delayMillis);
+          return this.waitForRetry(delayMillis).then(() => {
+            return this.sendWithRetry(config, attempts + 1);
+          });
         }
 
         if (err.response) {
@@ -274,15 +276,13 @@ export class HttpClient {
     return [this.backOffDelayMillis(retries), true];
   }
 
-  private retryRequest(config: HttpRequestConfig, attempts: number, delayMillis: number): Promise<HttpResponse> {
+  private waitForRetry(delayMillis: number): Promise<void> {
     if (delayMillis > 0) {
       return new Promise((resolve) => {
         setTimeout(resolve, delayMillis);
-      }).then(() => {
-        return this.sendWithRetry(config, attempts);
       });
     }
-    return this.sendWithRetry(config, attempts);
+    return Promise.resolve();
   }
 
   private isRetryEligible(retries: number, err: LowLevelError): boolean {
