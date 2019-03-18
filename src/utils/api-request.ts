@@ -261,6 +261,13 @@ export class HttpClient {
       });
   }
 
+  private createHttpResponse(resp: LowLevelResponse): HttpResponse {
+    if (resp.multipart) {
+      return new MultipartHttpResponse(resp);
+    }
+    return new DefaultHttpResponse(resp);
+  }
+
   private getRetryDelayMillis(retries: number, err: LowLevelError): [number, boolean] {
     if (!this.isRetryEligible(retries, err)) {
       return [0, false];
@@ -328,13 +335,6 @@ export class HttpClient {
     const backOffFactor = this.retry.backOffFactor || 0;
     const delayInSeconds = (2 ** retries) * backOffFactor;
     return Math.min(delayInSeconds * 1000, this.retry.maxDelayInMillis);
-  }
-
-  private createHttpResponse(resp: LowLevelResponse): HttpResponse {
-    if (resp.multipart) {
-      return new MultipartHttpResponse(resp);
-    }
-    return new DefaultHttpResponse(resp);
   }
 }
 
